@@ -33,21 +33,27 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
+#include <array>
 #include <mutex>
 #include <math.h>
 #include <thread>
 #include <fstream>
 #include <csignal>
+#include <new>
 #include <chrono>
+#include <stdexcept>
 #include <unistd.h>
 #include <Python.h>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include "IMU_Processing.hpp"
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <visualization_msgs/msg/marker.hpp>
+#include <pcl/PCLPointCloud2.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -74,6 +80,7 @@ double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_pl
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
+bool   known_map_en = false, known_map_loaded = false, initial_pose_received = false, relocalize_pending = false;
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -85,7 +92,8 @@ mutex mtx_buffer;
 condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
-string map_file_path, lid_topic, imu_topic, world_frame = "camera_init";
+string map_file_path, known_map_path, lid_topic, imu_topic;
+string map_frame = "map", initial_pose_topic = "/initialpose", world_frame = "camera_init";
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -115,6 +123,7 @@ PointCloudXYZI::Ptr feats_down_world(new PointCloudXYZI());
 PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1));
+PointCloudXYZI::Ptr known_map_cloud(new PointCloudXYZI());
 PointCloudXYZI::Ptr _featsArray;
 
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
@@ -143,6 +152,7 @@ esekfom::esekf<state_ikfom, 12, input_ikfom> kf_imu_odom;
 sensor_msgs::msg::Imu::ConstSharedPtr imu_odom_prev_msg;
 double imu_odom_last_stamp = -1.0;
 bool imu_odom_seeded = false;
+geometry_msgs::msg::PoseWithCovarianceStamped pending_initial_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
@@ -151,6 +161,10 @@ void reset_imu_odometry_seed();
 void seed_imu_odometry(const sensor_msgs::msg::Imu::ConstSharedPtr &seed_msg);
 void publish_imu_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr &pub_odom_imu,
                           const sensor_msgs::msg::Imu::ConstSharedPtr &msg);
+bool load_known_map();
+bool ensure_known_map_local_submap();
+bool apply_pending_initial_pose(const sensor_msgs::msg::Imu::ConstSharedPtr &last_imu_msg);
+void initial_pose_cbk(const geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr &msg);
 
 void SigHandle(int sig)
 {
@@ -158,6 +172,216 @@ void SigHandle(int sig)
     std::cout << "catch sig %d" << sig << std::endl;
     sig_buffer.notify_all();
     rclcpp::shutdown();
+}
+
+bool is_blank_string(const string &value)
+{
+    return value.find_first_not_of(" \t\r\n") == string::npos;
+}
+
+void reset_matching_tree()
+{
+    ikdtree.~KD_TREE<PointType>();
+    new (&ikdtree) KD_TREE<PointType>();
+}
+
+BoxPointType make_local_map_box(const V3D &center)
+{
+    BoxPointType box;
+    for (int i = 0; i < 3; ++i)
+    {
+        box.vertex_min[i] = center(i) - cube_len / 2.0;
+        box.vertex_max[i] = center(i) + cube_len / 2.0;
+    }
+    return box;
+}
+
+bool point_in_box(const V3D &point, const BoxPointType &box)
+{
+    for (int i = 0; i < 3; ++i)
+    {
+        if (point(i) < box.vertex_min[i] || point(i) > box.vertex_max[i])
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+void clear_pose_correlations(esekfom::esekf<state_ikfom, 12, input_ikfom>::cov &P)
+{
+    const int pose_state_indices[6] = {3, 4, 5, 0, 1, 2};
+    for (int i = 0; i < 6; ++i)
+    {
+        P.row(pose_state_indices[i]).setZero();
+        P.col(pose_state_indices[i]).setZero();
+    }
+}
+
+void apply_pose_covariance(esekfom::esekf<state_ikfom, 12, input_ikfom>::cov &P,
+                           const std::array<double, 36> &pose_covariance)
+{
+    const int pose_state_indices[6] = {3, 4, 5, 0, 1, 2};
+    clear_pose_correlations(P);
+    for (int row = 0; row < 6; ++row)
+    {
+        for (int col = 0; col < 6; ++col)
+        {
+            P(pose_state_indices[row], pose_state_indices[col]) = pose_covariance[row * 6 + col];
+        }
+    }
+}
+
+bool load_known_map()
+{
+    if (is_blank_string(known_map_path))
+    {
+        RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                     "Known-map mode requires a non-empty mapping.known_map_path.");
+        return false;
+    }
+
+    pcl::PCLPointCloud2 map_cloud_blob;
+    if (pcl::io::loadPCDFile(known_map_path, map_cloud_blob) != 0)
+    {
+        RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                     "Failed to load known-map PCD from: %s", known_map_path.c_str());
+        return false;
+    }
+
+    PointCloudXYZI::Ptr loaded_map(new PointCloudXYZI());
+    pcl::fromPCLPointCloud2(map_cloud_blob, *loaded_map);
+    if (loaded_map->empty())
+    {
+        RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                     "Loaded known-map PCD is empty: %s", known_map_path.c_str());
+        return false;
+    }
+
+    if (filter_size_map_min > 0.0)
+    {
+        downSizeFilterMap.setInputCloud(loaded_map);
+        downSizeFilterMap.filter(*known_map_cloud);
+    }
+    else
+    {
+        *known_map_cloud = *loaded_map;
+    }
+
+    if (known_map_cloud->empty())
+    {
+        RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                     "Known-map PCD became empty after filtering: %s", known_map_path.c_str());
+        return false;
+    }
+
+    known_map_loaded = true;
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                "Loaded known-map PCD with %zu points from %s",
+                known_map_cloud->size(), known_map_path.c_str());
+    return true;
+}
+
+bool rebuild_known_map_local_submap(const BoxPointType &local_box)
+{
+    PointVector local_points;
+    local_points.reserve(known_map_cloud->points.size());
+    for (const auto &point : known_map_cloud->points)
+    {
+        if (point.x >= local_box.vertex_min[0] && point.x <= local_box.vertex_max[0] &&
+            point.y >= local_box.vertex_min[1] && point.y <= local_box.vertex_max[1] &&
+            point.z >= local_box.vertex_min[2] && point.z <= local_box.vertex_max[2])
+        {
+            local_points.push_back(point);
+        }
+    }
+
+    if (local_points.size() < NUM_MATCH_POINTS)
+    {
+        RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                    "Known-map local submap has only %zu points around the current pose.",
+                    local_points.size());
+        return false;
+    }
+
+    reset_matching_tree();
+    ikdtree.set_downsample_param(filter_size_map_min);
+    ikdtree.Build(local_points);
+    featsFromMap->clear();
+    featsFromMap->points = local_points;
+    LocalMap_Points = local_box;
+    Localmap_Initialized = true;
+    kdtree_delete_counter = 0;
+    kdtree_delete_time = 0.0;
+    return true;
+}
+
+bool ensure_known_map_local_submap()
+{
+    if (!known_map_loaded)
+    {
+        return false;
+    }
+
+    const V3D pos_lid_world = pos_lid;
+    if (!Localmap_Initialized || !point_in_box(pos_lid_world, LocalMap_Points))
+    {
+        return rebuild_known_map_local_submap(make_local_map_box(pos_lid_world));
+    }
+    return true;
+}
+
+bool apply_pending_initial_pose(const sensor_msgs::msg::Imu::ConstSharedPtr &last_imu_msg)
+{
+    if (!relocalize_pending)
+    {
+        return false;
+    }
+
+    const auto initial_pose = pending_initial_pose;
+    Eigen::Quaterniond quat(initial_pose.pose.pose.orientation.w,
+                            initial_pose.pose.pose.orientation.x,
+                            initial_pose.pose.pose.orientation.y,
+                            initial_pose.pose.pose.orientation.z);
+    if (!std::isfinite(quat.norm()) || quat.norm() < 1e-6)
+    {
+        RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                    "Ignoring initial pose with invalid quaternion.");
+        relocalize_pending = false;
+        return false;
+    }
+    quat.normalize();
+
+    state_ikfom new_state = kf.get_x();
+    new_state.pos << initial_pose.pose.pose.position.x,
+                     initial_pose.pose.pose.position.y,
+                     initial_pose.pose.pose.position.z;
+    new_state.rot = SO3(quat);
+    new_state.vel = Zero3d;
+    kf.change_x(new_state);
+
+    auto P = kf.get_P();
+    apply_pose_covariance(P, initial_pose.pose.covariance);
+    kf.change_P(P);
+
+    state_point = kf.get_x();
+    euler_cur = SO3ToEuler(state_point.rot);
+    pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+    path.poses.clear();
+    path.header.stamp = get_ros_time(lidar_end_time);
+    path.header.frame_id = world_frame;
+    Localmap_Initialized = false;
+    featsFromMap->clear();
+    pointSearchInd_surf.clear();
+    Nearest_Points.clear();
+    reset_matching_tree();
+    reset_imu_odometry_seed();
+    p_imu->Reset(lidar_end_time, last_imu_msg);
+    initial_pose_received = true;
+    relocalize_pending = false;
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                "Applied known-map initial pose in frame '%s'.", world_frame.c_str());
+    return true;
 }
 
 inline void dump_lio_state_to_log(FILE *fp)  
@@ -358,6 +582,26 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     sig_buffer.notify_all();
 }
 
+void initial_pose_cbk(const geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr &msg)
+{
+    if (!known_map_en)
+    {
+        return;
+    }
+
+    if (msg->header.frame_id != world_frame)
+    {
+        RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                    "Ignoring initial pose in frame '%s'; expected '%s'.",
+                    msg->header.frame_id.c_str(), world_frame.c_str());
+        return;
+    }
+
+    pending_initial_pose = *msg;
+    relocalize_pending = true;
+    reset_imu_odometry_seed();
+}
+
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
     publish_count ++;
@@ -518,7 +762,7 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
         // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
         laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-        laserCloudmsg.header.frame_id = "camera_init";
+        laserCloudmsg.header.frame_id = world_frame;
         pubLaserCloudFull->publish(laserCloudmsg);
         publish_count -= PUBFRAME_PERIOD;
     }
@@ -587,7 +831,7 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
     pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
     laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudFullRes3.header.frame_id = "camera_init";
+    laserCloudFullRes3.header.frame_id = world_frame;
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
@@ -609,7 +853,7 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
+    laserCloudmsg.header.frame_id = world_frame;
     pubLaserCloudMap->publish(laserCloudmsg);
 
     // sensor_msgs::msg::PointCloud2 laserCloudMap;
@@ -922,6 +1166,10 @@ public:
         this->declare_parameter<double>("cube_side_length", 200.);
         this->declare_parameter<float>("mapping.det_range", 300.);
         this->declare_parameter<double>("mapping.fov_degree", 180.);
+        this->declare_parameter<bool>("mapping.known_map_en", false);
+        this->declare_parameter<string>("mapping.known_map_path", "");
+        this->declare_parameter<string>("mapping.map_frame", "map");
+        this->declare_parameter<string>("mapping.initial_pose_topic", "/initialpose");
         this->declare_parameter<double>("mapping.gyr_cov", 0.1);
         this->declare_parameter<double>("mapping.acc_cov", 0.1);
         this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
@@ -958,6 +1206,10 @@ public:
         this->get_parameter_or<double>("cube_side_length",cube_len,200.f);
         this->get_parameter_or<float>("mapping.det_range",DET_RANGE,300.f);
         this->get_parameter_or<double>("mapping.fov_degree",fov_deg,180.f);
+        this->get_parameter_or<bool>("mapping.known_map_en", known_map_en, false);
+        this->get_parameter_or<string>("mapping.known_map_path", known_map_path, "");
+        this->get_parameter_or<string>("mapping.map_frame", map_frame, "map");
+        this->get_parameter_or<string>("mapping.initial_pose_topic", initial_pose_topic, "/initialpose");
         this->get_parameter_or<double>("mapping.gyr_cov",gyr_cov,0.1);
         this->get_parameter_or<double>("mapping.acc_cov",acc_cov,0.1);
         this->get_parameter_or<double>("mapping.b_gyr_cov",b_gyr_cov,0.0001);
@@ -978,6 +1230,7 @@ public:
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
+        world_frame = known_map_en ? map_frame : "camera_init";
         path.header.stamp = this->get_clock()->now();
         path.header.frame_id = world_frame;
 
@@ -1009,6 +1262,11 @@ public:
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
+        if (known_map_en && !load_known_map())
+        {
+            throw std::runtime_error("Failed to initialize known-map localization.");
+        }
+
         /*** debug record ***/
         // FILE *fp;
         string pos_log_dir = root_dir + "/Log/pos_log.txt";
@@ -1033,6 +1291,11 @@ public:
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        if (known_map_en)
+        {
+            sub_initial_pose_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+                initial_pose_topic, 1, initial_pose_cbk);
+        }
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -1086,6 +1349,12 @@ private:
             p_imu->Process(Measures, kf, feats_undistort);
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+            if (known_map_en && relocalize_pending)
+            {
+                apply_pending_initial_pose(Measures.imu.empty() ? sensor_msgs::msg::Imu::ConstSharedPtr() : Measures.imu.back());
+                state_point = kf.get_x();
+                pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+            }
 
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
@@ -1093,10 +1362,25 @@ private:
                 return;
             }
 
+            if (known_map_en && !initial_pose_received)
+            {
+                return;
+            }
+
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
                             false : true;
             /*** Segment the map in lidar FOV ***/
-            lasermap_fov_segment();
+            if (known_map_en)
+            {
+                if (!ensure_known_map_local_submap())
+                {
+                    return;
+                }
+            }
+            else
+            {
+                lasermap_fov_segment();
+            }
 
             /*** downsample the feature points in a scan ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
@@ -1104,7 +1388,7 @@ private:
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
             /*** initialize the map kdtree ***/
-            if(ikdtree.Root_Node == nullptr)
+            if(!known_map_en && ikdtree.Root_Node == nullptr)
             {
                 RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
                 if(feats_down_size > 5)
@@ -1160,6 +1444,10 @@ private:
             state_point = kf.get_x();
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+            if (known_map_en && !ensure_known_map_local_submap())
+            {
+                return;
+            }
             if (flg_EKF_inited && !Measures.imu.empty())
             {
                 seed_imu_odometry(Measures.imu.back());
@@ -1176,12 +1464,21 @@ private:
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
-            map_incremental();
-            t5 = omp_get_wtime();
+            if (!known_map_en)
+            {
+                map_incremental();
+                t5 = omp_get_wtime();
+            }
+            else
+            {
+                add_point_size = 0;
+                kdtree_incremental_time = 0.0;
+                t5 = t3;
+            }
             
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath_);
-            if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
+            if (scan_pub_en || pcd_save_en)     publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
@@ -1249,6 +1546,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr sub_initial_pose_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
