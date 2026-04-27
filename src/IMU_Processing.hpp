@@ -46,6 +46,11 @@ class ImuProcess
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
+  bool BuildPredictionInput(const sensor_msgs::msg::Imu::ConstSharedPtr &head,
+                            const sensor_msgs::msg::Imu::ConstSharedPtr &tail,
+                            input_ikfom &input,
+                            V3D &gyro_avg,
+                            V3D &acc_avg) const;
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 
@@ -153,6 +158,36 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a)
   cov_bias_acc = b_a;
 }
 
+bool ImuProcess::BuildPredictionInput(const sensor_msgs::msg::Imu::ConstSharedPtr &head,
+                                      const sensor_msgs::msg::Imu::ConstSharedPtr &tail,
+                                      input_ikfom &input,
+                                      V3D &gyro_avg,
+                                      V3D &acc_avg) const
+{
+  if (head == nullptr || tail == nullptr)
+  {
+    return false;
+  }
+
+  const double mean_acc_norm = mean_acc.norm();
+  if (mean_acc_norm < 1e-6)
+  {
+    return false;
+  }
+
+  gyro_avg << 0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
+              0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
+              0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
+  acc_avg << 0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x),
+             0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
+             0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
+  acc_avg = acc_avg * G_m_s2 / mean_acc_norm;
+
+  input.acc = acc_avg;
+  input.gyro = gyro_avg;
+  return true;
+}
+
 void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
 {
   /** 1. initializing the gravity, gyro bias, acc and gyro covariance
@@ -247,17 +282,13 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     double head_stamp = rclcpp::Time(head->header.stamp).seconds();
 
     if (tail_stamp < last_lidar_end_time_)    continue;
-    
-    angvel_avr<<0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
-                0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
-                0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
-    acc_avr   <<0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x),
-                0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
-                0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
+
+    if (!BuildPredictionInput(head, tail, in, angvel_avr, acc_avr))
+    {
+      continue;
+    }
 
     // fout_imu << setw(10) << head->header.stamp.toSec() - first_lidar_time << " " << angvel_avr.transpose() << " " << acc_avr.transpose() << endl;
-
-    acc_avr     = acc_avr * G_m_s2 / mean_acc.norm(); // - state_inout.ba;
 
     if(head_stamp < last_lidar_end_time_)
     {
@@ -268,9 +299,6 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     {
       dt = tail_stamp - head_stamp;
     }
-    
-    in.acc = acc_avr;
-    in.gyro = angvel_avr;
     Q.block<3, 3>(0, 0).diagonal() = cov_gyr;
     Q.block<3, 3>(3, 3).diagonal() = cov_acc;
     Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
