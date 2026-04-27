@@ -17,6 +17,10 @@ mapping:
     b_gyr_cov: 0.0001
     fov_degree:    90
     det_range:     450.0
+    known_map_en: false
+    map_file_path: ""
+    map_frame: map
+    initial_pose_topic: "/initialpose"
     extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
     extrinsic_T: [ 0.04165, 0.02326, -0.0284 ]
     extrinsic_R: [ 1, 0, 0,
