@@ -156,6 +156,8 @@ geometry_msgs::msg::PoseWithCovarianceStamped pending_initial_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+BoxPointType LocalMap_Points;
+bool Localmap_Initialized = false;
 
 void reset_imu_odometry_seed();
 void seed_imu_odometry(const sensor_msgs::msg::Imu::ConstSharedPtr &seed_msg);
@@ -463,8 +465,6 @@ void points_cache_collect()
     // for (int i = 0; i < points_history.size(); i++) _featsArray->push_back(points_history[i]);
 }
 
-BoxPointType LocalMap_Points;
-bool Localmap_Initialized = false;
 void lasermap_fov_segment()
 {
     cub_needrm.clear();
@@ -948,7 +948,7 @@ void publish_imu_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::Shar
     }
 
     const double msg_stamp = get_time_sec(msg->header.stamp);
-    const double dt = msg_stamp - imu_odom_last_stamp;
+    double dt = msg_stamp - imu_odom_last_stamp;
     if (dt <= 0.0)
     {
         if (dt < 0.0)
@@ -966,7 +966,7 @@ void publish_imu_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::Shar
         return;
     }
 
-    const auto imu_Q = p_imu->Q;
+    auto imu_Q = p_imu->Q;
     kf_imu_odom.predict(dt, imu_Q, imu_input);
     const state_ikfom &imu_state = kf_imu_odom.get_x();
     const V3D angular_world = imu_state.rot * (gyro_avr - imu_state.bg);

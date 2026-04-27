@@ -120,6 +120,26 @@ void ImuProcess::Reset()
   cur_pcl_un_.reset(new PointCloudXYZI());
 }
 
+void ImuProcess::Reset(double start_timestamp, const sensor_msgs::msg::Imu::ConstSharedPtr &lastimu)
+{
+  start_timestamp_ = start_timestamp;
+  last_lidar_end_time_ = start_timestamp;
+  v_imu_.clear();
+  IMUpose.clear();
+  cur_pcl_un_.reset(new PointCloudXYZI());
+  angvel_last = Zero3d;
+  acc_s_last = Zero3d;
+  if (lastimu != nullptr)
+  {
+    last_imu_ = lastimu;
+  }
+  else
+  {
+    last_imu_.reset(new sensor_msgs::msg::Imu());
+  }
+  b_first_frame_ = false;
+}
+
 void ImuProcess::set_extrinsic(const MD(4,4) &T)
 {
   Lidar_T_wrt_IMU = T.block<3,1>(0,3);
