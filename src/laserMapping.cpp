@@ -103,7 +103,8 @@ double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_en
 int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
 bool   point_selected_surf[100000] = {0};
-bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
+bool   lidar_pushed, flg_first_scan = true, flg_EKF_inited;
+volatile sig_atomic_t flg_exit = 0;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool    is_first_lidar = true;
 
@@ -170,10 +171,8 @@ void initial_pose_cbk(const geometry_msgs::msg::PoseWithCovarianceStamped::Const
 
 void SigHandle(int sig)
 {
-    flg_exit = true;
-    std::cout << "catch sig %d" << sig << std::endl;
-    sig_buffer.notify_all();
-    rclcpp::shutdown();
+    (void)sig;
+    flg_exit = 1;
 }
 
 bool is_blank_string(const string &value)
@@ -770,7 +769,6 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
     /**************** save map ****************/
     /* 1. make sure you have enough memories
     /* 2. noted that pcd save will influence the real-time performences **/
-    /*
     if (pcd_save_en)
     {
         int size = feats_undistort->points.size();
@@ -797,7 +795,6 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
             scan_wait_num = 0;
         }
     }
-    */
 }
 
 void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
@@ -1327,6 +1324,13 @@ public:
 private:
     void timer_callback()
     {
+        if (flg_exit)
+        {
+            RCLCPP_INFO(this->get_logger(), "Shutdown requested, saving map if enabled.");
+            rclcpp::shutdown();
+            return;
+        }
+
         if(sync_packages(Measures))
         {
             if (flg_first_scan)
